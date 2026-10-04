@@ -274,6 +274,10 @@ class Config:
     HAL_COLUMN: str = 'Log_Freq_HAL'
     SUBTLEX_COLUMNS: list[str] = field(default_factory=lambda: ['LgSUBTLWF', 'SUBTLWF'])
     BIGRAM_COLUMN: str = 'BG_Mean'
+    # Column whose tertiles define the HF / LF word groups (H2 and every group
+    # contrast). HAL is ELP's native frequency norm; 'subtlex' requires a
+    # SUBTLEX column. The continuous slope is reported for both regardless.
+    FREQUENCY_GROUP_COLUMN: str = 'log_freq_hal'
     HIGH_FREQ_PERCENTILE: float = 100 * 2 / 3
     LOW_FREQ_PERCENTILE: float = 100 / 3
     MODELS: list[ModelConfig] = field(default_factory=default_models)
@@ -309,7 +313,7 @@ class Config:
     RUN_RANDOM_INIT: bool = True                  # H1b
     RUN_MEAN_POOL_CONTROL: bool = True            # position control
     RUN_PROMPT_ROBUSTNESS: bool = True            # I3
-    RUN_CAUSAL: bool = True                       # RQ4
+    RUN_EXPLORATORY_CAUSAL: bool = True           # RQ4 exploratory block (H4 always runs: confirmatory)
     RUN_CONTEXTUAL: bool = True                   # RQ6
     RUN_INSTRUCT_VARIANTS: bool = True            # RQ5: instruct counterparts of base models
     LAYER_MODE_MLP: str = 'all'                   # 'all' | 'representative'
@@ -365,6 +369,8 @@ class Config:
         need(self.REP_DTYPE in ('float32', 'float16'), "REP_DTYPE")
         need(0 <= self.RT_MIN_ACCURACY < 1, "RT_MIN_ACCURACY in [0, 1)")
         need(0 < self.NORM_MIN_COVERAGE <= 1, "NORM_MIN_COVERAGE in (0, 1]")
+        need(self.FREQUENCY_GROUP_COLUMN in ('log_freq_hal', 'subtlex'),
+             "FREQUENCY_GROUP_COLUMN in log_freq_hal|subtlex")
         need(self.H4_ALPHA > 0, "H4_ALPHA > 0")
         for nd in self.LEXICAL_NORMS:
             need(isinstance(nd, dict) and {'path', 'word_column', 'columns'} <= set(nd),
@@ -441,6 +447,17 @@ def p_from_t(t, df) -> tuple[float, float]:
         lsf = float(stats.t.logpdf(at, nu) + np.log((nu + at * at) / ((nu + 1.0) * at)))
     lp = min(0.0, float(np.log(2.0) + lsf))
     return float(np.exp(lp)), lp / _LN10
+
+
+def p_from_t_greater(t, df) -> tuple[float, float]:
+    """One-sided Student-t p = P(T ≥ t) and log10 p (for directional tests)."""
+    if not (finite(t) and finite(df)) or df <= 0:
+        return np.nan, np.nan
+    if t <= 0:
+        p = float(stats.t.sf(t, df))
+        return p, float(np.log10(p))
+    p2, lp2 = p_from_t(t, df)                 # two-sided, underflow-safe tail
+    return p2 / 2, lp2 - np.log10(2.0)
 
 
 def p_from_f(f, df1, df2) -> tuple[float, float]:
@@ -636,23 +653,30 @@ def ols_term(y, X: pd.DataFrame, term: str) -> dict:
     return out
 
 
+NESTED_OLS_KEYS = ('n', 'r2_base', 'r2_full', 'delta_r2', 'f_statistic', 'p_f', 'p_f_log10',
+                   'beta_std', 'beta_se_hc3', 'p_hc3', 'p_hc3_log10', 'log10_bf01', 'note')
+
+
 def nested_ols(y, X_base: pd.DataFrame, X_add: pd.DataFrame) -> dict:
     """Incremental validity: R² of base vs base + added predictors, partial F
     test, and for a single added predictor its HC3 coefficient test and BIC
-    Bayes factor."""
+    Bayes factor. Always returns every key of NESTED_OLS_KEYS (NaN when not
+    estimable; `note` says why), so result tables have a fixed schema."""
     y = np.asarray(y, float)
+    out = {k: np.nan for k in NESTED_OLS_KEYS}
+    out.update({'n': int(len(y)), 'note': ''})
     if (X_add.std(ddof=0) == 0).any():
-        return {'n': int(len(y)), 'delta_r2': np.nan, 'p_f': np.nan, 'p_f_log10': np.nan,
-                'note': 'added predictor is constant — model not identifiable'}
+        out['note'] = 'added predictor is constant — model not identifiable'
+        return out
     f0 = sm.OLS(y, _design(X_base)).fit()
     Xf = pd.concat([X_base, X_add], axis=1)
     f1 = sm.OLS(y, _design(Xf)).fit()
     q = X_add.shape[1]
     F = ((f0.ssr - f1.ssr) / q) / (f1.ssr / f1.df_resid)
     p, lp = p_from_f(F, q, f1.df_resid)
-    out = {'n': int(f1.nobs), 'r2_base': float(f0.rsquared), 'r2_full': float(f1.rsquared),
-           'delta_r2': float(f1.rsquared - f0.rsquared), 'f_statistic': float(F),
-           'p_f': p, 'p_f_log10': lp}
+    out.update({'n': int(f1.nobs), 'r2_base': float(f0.rsquared), 'r2_full': float(f1.rsquared),
+                'delta_r2': float(f1.rsquared - f0.rsquared), 'f_statistic': float(F),
+                'p_f': p, 'p_f_log10': lp})
     if q == 1:
         t = ols_term(y, Xf, X_add.columns[0])
         out.update({'beta_std': t['beta'], 'beta_se_hc3': t['se_hc3'], 'p_hc3': t['p_hc3'],
@@ -755,6 +779,15 @@ def layer_at_depth(n_layers: int, depth: float) -> int:
     return int(np.clip(round(depth * n_layers) - 1, 0, n_layers - 1))
 
 
+def common_depth_curves(tbl: pd.DataFrame, value: str, n: int):
+    """Per-model curves of `value` on relative depth (l + 1) / L — the depth
+    scale used everywhere else — interpolated on a common grid that spans only
+    depths every model covers, [max_m 1/L_m, 1], so nothing is extrapolated."""
+    groups = list(tbl.sort_values('layer').groupby('model'))
+    grid = np.linspace(max(g['relative_depth'].min() for _, g in groups), 1.0, n)
+    return grid, {m: np.interp(grid, g['relative_depth'], g[value]) for m, g in groups}
+
+
 def logit(p, eps):
     p = np.clip(np.asarray(p, float), eps, 1 - eps)
     return np.log(p / (1 - p))
@@ -770,6 +803,15 @@ def stimulus_hash(s: str) -> str:
 def _numeric(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s.astype(str).str.replace(',', '', regex=False)
                          .replace({'#': np.nan, 'nan': np.nan, '': np.nan}), errors='coerce')
+
+
+def split_strata(items: pd.DataFrame) -> pd.Series:
+    """Stratification labels word/nonword × frequency group for every seeded
+    split. Strata with a single item (which stratified splitting cannot
+    handle) are pooled with the largest stratum."""
+    s = items['is_word'].astype(str) + '_' + items['freq_group'].astype(str)
+    counts = s.value_counts()
+    return s.where(s.map(counts) >= 2, counts.idxmax())
 
 
 def load_items(cfg: Config) -> tuple[pd.DataFrame, dict]:
@@ -829,16 +871,21 @@ def load_items(cfg: Config) -> tuple[pd.DataFrame, dict]:
                        nonwords.sample(n=n, random_state=SEED)], ignore_index=True)
     items = items.sample(frac=1.0, random_state=SEED).reset_index(drop=True)
 
-    items['freq_group'] = np.where(items['is_word'] == 1, 'mid', 'nonword')
-    wf = items.loc[items['is_word'] == 1, 'log_freq_hal']
+    # HF / LF tertiles of FREQUENCY_GROUP_COLUMN among the sampled words; words
+    # without a value form their own 'unknown' group (never folded into 'mid').
+    fcol = cfg.FREQUENCY_GROUP_COLUMN
+    is_w = items['is_word'] == 1
+    if items.loc[is_w, fcol].notna().sum() < 3:
+        raise ValueError(f"FREQUENCY_GROUP_COLUMN={fcol!r} has no values in the word file")
+    items['freq_group'] = np.where(is_w, 'mid', 'nonword')
+    wf = items.loc[is_w, fcol]
     hi, lo = np.nanpercentile(wf, cfg.HIGH_FREQ_PERCENTILE), np.nanpercentile(wf, cfg.LOW_FREQ_PERCENTILE)
-    items.loc[(items['is_word'] == 1) & (items['log_freq_hal'] >= hi), 'freq_group'] = 'high'
-    items.loc[(items['is_word'] == 1) & (items['log_freq_hal'] <= lo), 'freq_group'] = 'low'
-    items.loc[(items['is_word'] == 1) & items['log_freq_hal'].isna(), 'freq_group'] = 'unknown'
+    items.loc[is_w & (items[fcol] >= hi), 'freq_group'] = 'high'
+    items.loc[is_w & (items[fcol] <= lo), 'freq_group'] = 'low'
+    items.loc[is_w & items[fcol].isna(), 'freq_group'] = 'unknown'
 
-    strata = items['is_word'].astype(str) + '_' + items['freq_group'].replace('unknown', 'mid')
     sel, _ = train_test_split(np.arange(len(items)), train_size=cfg.SELECTION_FRACTION,
-                              stratify=strata, random_state=SEED)
+                              stratify=split_strata(items), random_state=SEED)
     items['split'] = 'evaluation'
     items.loc[sel, 'split'] = 'selection'
     wmask = items['is_word'] == 1
@@ -846,7 +893,9 @@ def load_items(cfg: Config) -> tuple[pd.DataFrame, dict]:
                                     if items.loc[wmask, c].notna().mean() >= cfg.NORM_MIN_COVERAGE]
     info['word_norms_coverage'] = {c: float(items.loc[wmask, c].notna().mean()) for c in norm_names}
     info.update({'n_items': len(items), 'n_per_class': n,
-                 'hal_tertile_cutoffs': {'high_ge': float(hi), 'low_le': float(lo)},
+                 'frequency_group_column': fcol,
+                 'frequency_tertile_cutoffs': {'high_ge': float(hi), 'low_le': float(lo)},
+                 'n_words_without_frequency': int((items['freq_group'] == 'unknown').sum()),
                  'n_high': int((items['freq_group'] == 'high').sum()),
                  'n_low': int((items['freq_group'] == 'low').sum()),
                  'n_selection': int((items['split'] == 'selection').sum())})
@@ -1380,7 +1429,11 @@ class Prober:
         return (X_tr - A_tr @ B).astype(np.float32), (X_te - A_te @ B).astype(np.float32)
 
     def crossfit(self, X, y, folds, kind='linear', covariates=None) -> np.ndarray:
-        """Out-of-fold P(class 1) for every row."""
+        """Out-of-fold P(class 1) for every row.
+        kind       : 'linear' (L2 logistic regression, the primary probe) or
+                     'mlp' (non-linear capacity check); anything else raises.
+        covariates : optional (N, q) matrix linearly erased from X inside every
+                     training fold (see residualize)."""
         X, y = np.asarray(X), np.asarray(y).astype(int)
         oof = np.full(len(y), np.nan)
         for k in np.unique(folds):
@@ -1411,7 +1464,10 @@ class Prober:
           combined : baseline OLS + ridge on h fitted to the baseline RESIDUAL
         Ridge alpha is chosen on an inner 20% split of each training fold.
         ΔR² = R²(combined) − R²(baseline) on out-of-fold predictions, tested
-        with a paired t-test on per-item squared-error reductions."""
+        with a ONE-SIDED paired t-test on per-item squared-error reductions
+        (H1: h reduces error). A two-sided test would report a significant
+        worsening — the expected effect of adding pure-noise features — as if
+        it were evidence of information beyond the baseline."""
         X, y = np.asarray(X, np.float64), np.asarray(y, float)
         Zall = np.asarray(baseline, float)
         pred_h, pred_b, pred_c = (np.full(len(y), np.nan) for _ in range(3))
@@ -1430,7 +1486,7 @@ class Prober:
         ss = np.sum((y - y.mean()) ** 2)
         r2 = lambda p: float(1 - np.sum((y - p) ** 2) / ss)
         gain = (y - pred_b) ** 2 - (y - pred_c) ** 2
-        p, lp = p_from_t(gain.mean() / (gain.std(ddof=1) / np.sqrt(len(gain))), len(gain) - 1)
+        p, lp = p_from_t_greater(gain.mean() / (gain.std(ddof=1) / np.sqrt(len(gain))), len(gain) - 1)
         return {'n': int(len(y)), 'r2_baseline': r2(pred_b), 'r2_hidden': r2(pred_h),
                 'r2_combined': r2(pred_c), 'delta_r2_beyond_baseline': r2(pred_c) - r2(pred_b),
                 'spearman_hidden': float(stats.spearmanr(pred_h, y)[0]),
@@ -1628,11 +1684,24 @@ class CausalAnalyses:
         self.y, self.fg = y[self.ev], fg[self.ev]
         self.texts = [build_prompt(s)[0] for s in items['stimulus'].to_numpy()[self.ev]]
         self.spans = [build_prompt(s)[1] for s in items['stimulus'].to_numpy()[self.ev]]
-        self.rng = np.random.RandomState(SEED + 102)
+
+    # Each intervention draws from its OWN seeded stream, so its null does not
+    # depend on which other interventions ran before it, or in what order.
+    _STREAM = {'confirmatory_steering': 201, 'steering': 202, 'subspace_ablation': 203,
+               'head_ablation': 204, 'attention': 205}
+
+    @classmethod
+    def _rng(cls, method: str) -> np.random.RandomState:
+        return np.random.RandomState(SEED + cls._STREAM[method])
 
     # ── batched forward with transient hooks; returns final-layer margins ──
     @torch.no_grad()
     def _margins(self, install=None, state_layer=None):
+        """Final-layer margins m = logit(YES) − logit(NO) for the evaluation items.
+        install     : optional fn(fp) → list of hook handles, installed per batch
+                      and removed afterwards (the intervention).
+        state_layer : if given, ALSO return the decision-site hidden states of
+                      that layer, i.e. the return value becomes (m, states)."""
         lm, bs = self.lm, self.cfg.CAUSAL_BATCH_SIZE
         m_out, st_out = [], []
         for s in range(0, len(self.texts), bs):
@@ -1698,11 +1767,12 @@ class CausalAnalyses:
         direction, s = SD of training projections on u (α in SD units)."""
         m0 = self._margins()
         base = self._summary(m0)
+        rng = self._rng('steering')
         rows = []
         for li in tqdm(self.layers, desc=f"RQ4 steering | {self.lm.mc.name}", leave=False):
             X, spaces = self._directions(li)
             dirs = {k: raw_direction(self.prober.fit_linear(Xs, ys)) for k, (Xs, ys) in spaces.items()}
-            rand = [r / np.linalg.norm(r) for r in self.rng.randn(self.cfg.CAUSAL_N_RANDOM, X.shape[1])]
+            rand = [r / np.linalg.norm(r) for r in rng.randn(self.cfg.CAUSAL_N_RANDOM, X.shape[1])]
             for alpha in self.cfg.STEERING_MAGNITUDES:
                 def shift(u):
                     v = torch.as_tensor(alpha * float(np.std(X @ u)) * u, dtype=torch.float32)
@@ -1740,9 +1810,10 @@ class CausalAnalyses:
             mn = self._margins(self._layer_hook(R, lambda h: h - vt.to(h.device)))
             return 0.5 * (mp - mn)
         d = contrast(u)
+        rng = self._rng('confirmatory_steering')
         null = []
         for _ in tqdm(range(self.cfg.H4_N_NULL), desc=f"H4 null | {self.lm.mc.name}", leave=False):
-            r = self.rng.randn(X.shape[1])
+            r = rng.randn(X.shape[1])
             null.append(float(contrast(r / np.linalg.norm(r)).mean()))
         null = np.asarray(null)
         T = float(d.mean())
@@ -1760,6 +1831,7 @@ class CausalAnalyses:
         held-out fit items (post-erasure probe accuracy)."""
         m0 = self._margins()
         base = self._summary(m0)
+        rng = self._rng('subspace_ablation')
         rows = []
         for li in tqdm(self.layers, desc=f"RQ4 subspace | {self.lm.mc.name}", leave=False):
             X, spaces = self._directions(li)
@@ -1779,7 +1851,7 @@ class CausalAnalyses:
                 post = self.prober.fit_linear(P(Xs[tr]), ys[tr])
                 post_acc = float(np.mean((Prober.decision(post, P(Xs[te])) > 0).astype(int) == ys[te]))
                 s1 = self._summary(ablate(U))
-                nulls = [self._summary(ablate(np.linalg.qr(self.rng.randn(X.shape[1], U.shape[1]))[0]))
+                nulls = [self._summary(ablate(np.linalg.qr(rng.randn(X.shape[1], U.shape[1]))[0]))
                          for _ in range(self.cfg.CAUSAL_N_RANDOM)]
                 key = 'accuracy' if name == 'lexicality' else 'hf_minus_lf_margin'
                 rows.append({'layer': li, 'relative_depth': (li + 1) / self.lm.num_layers,
@@ -1852,7 +1924,8 @@ class CausalAnalyses:
         base = ablate([])
         abl = ablate([(r['layer'], r['head']) for r in top])
         allh = [(li, h) for li in range(R + 1) for h in range(nH)]
-        nulls = [ablate([allh[i] for i in self.rng.choice(len(allh), k, replace=False)])
+        rng = self._rng('head_ablation')
+        nulls = [ablate([allh[i] for i in rng.choice(len(allh), k, replace=False)])
                  for _ in range(self.cfg.CAUSAL_N_RANDOM)]
         rows = []
         for key in ('probe_accuracy', 'accuracy', 'mean_margin_words', 'mean_margin_nonwords'):
@@ -1872,6 +1945,7 @@ class CausalAnalyses:
         mass = np.zeros((len(self.ev), L, 3))
         n_stim = np.zeros(len(self.ev))
         bs = self.cfg.CAUSAL_BATCH_SIZE
+        rng = self._rng('attention')
         with lm.instrumented() as ctx:
             for s in range(0, len(self.texts), bs):
                 ids, am, fp, smask = lm.encode(self.texts[s:s + bs], self.spans[s:s + bs])
@@ -1915,7 +1989,7 @@ class CausalAnalyses:
                             ci = torch.nonzero(cand).flatten().cpu().numpy()
                             k = int(smask[b].sum())
                             if len(ci) and k:
-                                blk[b, torch.as_tensor(self.rng.choice(ci, min(k, len(ci)), replace=False),
+                                blk[b, torch.as_tensor(rng.choice(ci, min(k, len(ci)), replace=False),
                                                        device=blk.device)] = True
                     ctx.query_pos, ctx.block, ctx.capture, ctx.layers = fp, blk, None, layer_set
                     hs = lm.hidden_states(ids, am)
@@ -1955,6 +2029,7 @@ class ModelStudy:
         self.mc, self.cfg = mc, cfg
         self.items = items.copy()
         self.word_norms = list(word_norms)
+        self._log_rt_cache: dict[bool, bool] = {}
         self.dir = cfg.model_dir(mc.name)
         self.prober = Prober(cfg)
         self.summary: dict = {'model': mc.name, 'family': mc.family, 'variant': mc.variant,
@@ -2086,7 +2161,7 @@ class ModelStudy:
         ca = CausalAnalyses(lm, self.items, reps, self.prober, self.cfg, layers, self.best)
         self.h4 = ca.confirmatory_steering()
         self._save('confirmatory_h4_steering', self._tag([self.h4]))
-        if not self.cfg.RUN_CAUSAL:
+        if not self.cfg.RUN_EXPLORATORY_CAUSAL:
             return
         for name, fn in (('causal_steering', ca.steering), ('causal_subspace_ablation', ca.subspace_ablation)):
             try:
@@ -2107,11 +2182,10 @@ class ModelStudy:
             logger.error(f"[{self.mc.name}] attention analyses failed: {e}", exc_info=True)
 
     def _subsample(self, n, seed):
-        strata = self.items['is_word'].astype(str) + '_' + self.items['freq_group'].replace('unknown', 'mid')
         if n >= len(self.items):
             return np.arange(len(self.items))
-        idx, _ = train_test_split(np.arange(len(self.items)), train_size=n, stratify=strata,
-                                  random_state=seed)
+        idx, _ = train_test_split(np.arange(len(self.items)), train_size=n,
+                                  stratify=split_strata(self.items), random_state=seed)
         return np.sort(idx)
 
     def _prompt_robustness(self, lm, reps):
@@ -2237,11 +2311,14 @@ class ModelStudy:
             self._save('layers_mlp_probe', self._tag(layer_table(
                 oof, self.y, self.fg, cfg, {'readout': 'crossfitted_mlp_probe'}, self.L)))
             self._save('paired_mlp_vs_linear', self._tag(paired_vs_reference(oof, self.oof, self.y, cfg)))
-        # label-permutation control (Hewitt & Liang, 2019): must be at chance
+        # label-permutation control (Hewitt & Liang, 2019): must be at chance.
+        # Folds are re-stratified on the PERMUTED labels, so each training fold
+        # has the same class balance as the target being fitted.
         perm_y = np.random.RandomState(SEED + 3).permutation(self.y)
+        perm_folds = self.prober.folds(perm_y, SEED + 3)
         rows = []
         for li in select_layers(self.L, cfg.LAYER_MODE_CONTROLS):
-            p = self.prober.crossfit(reps[li], perm_y, self.folds)
+            p = self.prober.crossfit(reps[li], perm_y, perm_folds)
             rows.append({'layer': li, 'relative_depth': (li + 1) / self.L,
                          'accuracy_on_permuted_labels': float(np.mean((p >= 0.5) == perm_y)),
                          **auc_with_ci(p[perm_y == 1], p[perm_y == 0]),
@@ -2269,7 +2346,7 @@ class ModelStudy:
             r.update({'hal_x_length_beta': t2['beta'], 'hal_x_length_p_hc3': t2['p_hc3'],
                       'hal_x_length_log10_bf01': t2['log10_bf01']})
             sm_ = words & it['subtlex'].notna().to_numpy()
-            if sm_.sum() > 0.8 * words.sum():
+            if sm_.sum() >= self.cfg.NORM_MIN_COVERAGE * words.sum():
                 Zs = zscore_frame(it.loc[sm_, ['subtlex'] + cov_names].reset_index(drop=True))
                 t3 = ols_term(self._evidence(self.oof[li])[sm_], Zs, 'subtlex')
                 r.update({'subtlex_beta': t3['beta'], 'subtlex_p_hc3': t3['p_hc3']})
@@ -2366,11 +2443,15 @@ class ModelStudy:
 
     def _log_rt(self, word: bool) -> bool:
         """log RT iff |skew| of the class's valid RTs exceeds the threshold —
-        decided once per class from human data only (model-independent)."""
-        it = self.items
-        rt = it.loc[(it['is_word'] == int(word)) & (it['human_rt'] > 0)
-                    & (it['human_accuracy'] >= self.cfg.RT_MIN_ACCURACY), 'human_rt']
-        return bool(abs(stats.skew(rt.to_numpy(float))) > self.cfg.RT_LOG_SKEW_THRESHOLD)
+        decided once per class from human data only (model-independent) and
+        cached, because it is identical for every layer and predictor."""
+        if word not in self._log_rt_cache:
+            it = self.items
+            rt = it.loc[(it['is_word'] == int(word)) & (it['human_rt'] > 0)
+                        & (it['human_accuracy'] >= self.cfg.RT_MIN_ACCURACY), 'human_rt']
+            self._log_rt_cache[word] = bool(abs(stats.skew(rt.to_numpy(float)))
+                                            > self.cfg.RT_LOG_SKEW_THRESHOLD)
+        return self._log_rt_cache[word]
 
     def _rt_outcome(self, m):
         rt = self.items.loc[m, 'human_rt'].to_numpy(float)
@@ -2378,15 +2459,21 @@ class ModelStudy:
         return (np.log(rt) if use_log else rt), use_log
 
     def _incremental(self, m, covs, predictor: np.ndarray) -> dict:
+        """ΔR² of `predictor` over the covariates `covs` for the items in mask m
+        (RT outcome per _rt_outcome). Both the covariates and the predictor are
+        z-scored, so `beta_std` is the RT change per SD of the predictor and is
+        comparable across predictors (probe evidence S vs native margin M);
+        ΔR² is scale-free. Every call returns NESTED_OLS_KEYS + spearman_rho,
+        log_rt, log10_bf01_label — NaN / 'undetermined' when the predictor is
+        constant (see nested_ols)."""
         y_rt, use_log = self._rt_outcome(m)
         Xb = zscore_frame(self.items.loc[m, covs].reset_index(drop=True))
         Xa = pd.DataFrame({'S': predictor[m]})
         out = nested_ols(y_rt, Xb, Xa if Xa['S'].std() == 0 else zscore_frame(Xa))
-        if not finite(out['delta_r2']):
-            return {**out, 'spearman_rho': np.nan, 'log_rt': use_log}
-        rho, _ = stats.spearmanr(predictor[m], self.items.loc[m, 'human_rt'])
-        out.update({'spearman_rho': float(rho), 'log_rt': use_log,
-                    'log10_bf01_label': bf_label(out.get('log10_bf01'), self.cfg.BF_THRESHOLD)})
+        rho = (float(stats.spearmanr(predictor[m], self.items.loc[m, 'human_rt'])[0])
+               if finite(out['delta_r2']) else np.nan)
+        out.update({'spearman_rho': rho, 'log_rt': use_log,
+                    'log10_bf01_label': bf_label(out['log10_bf01'], self.cfg.BF_THRESHOLD)})
         return out
 
     def _rt(self):
@@ -2395,6 +2482,10 @@ class ModelStudy:
         wm, nm = self._rt_sample(True, wc), self._rt_sample(False, nc)
         self.summary.update({'rt_word_covariates': wc, 'rt_nonword_covariates': nc,
                              'rt_n_words': int(wm.sum()), 'rt_n_nonwords': int(nm.sum())})
+        # Two predictor families: S = logit of the cross-fitted probe P(WORD)
+        # and M = the model's own logit-lens YES/NO margin. Their raw scales
+        # differ, but _incremental z-scores every predictor, so beta_std (RT per
+        # SD) and ΔR² (scale-free) are comparable across the two families.
         rows = []
         for li in range(self.L):
             S, M = self._evidence(self.oof[li]), self.margin[:, li]
@@ -2514,9 +2605,9 @@ class ModelStudy:
             r = self._incremental(m, wc, self._evidence(p))
             rows.append({'hypothesis': 'H3', 'test': f"ΔR² of S over {'+'.join(wc)} (partial F)",
                          'estimate': r['delta_r2'], 'ci95_low': np.nan, 'ci95_high': np.nan,
-                         'p': r['p_f'], 'p_log10': r['p_f_log10'], 'beta_std_S': r.get('beta_std'),
-                         'p_hc3_S': r.get('p_hc3'), 'log10_bf01': r.get('log10_bf01'),
-                         'bf01_label': r.get('log10_bf01_label'), 'n': r['n']})
+                         'p': r['p_f'], 'p_log10': r['p_f_log10'], 'beta_std_S': r['beta_std'],
+                         'p_hc3_S': r['p_hc3'], 'log10_bf01': r['log10_bf01'],
+                         'bf01_label': r['log10_bf01_label'], 'n': r['n']})
         h4 = self.h4
         rows.append({'hypothesis': 'H4', 'test': (f"antisymmetric steering ½[m(+{h4['alpha_sd']}σu) − "
                                                   f"m(−{h4['alpha_sd']}σu)] vs {h4['n_null']} random directions"),
@@ -2543,6 +2634,12 @@ class Aggregator:
                        if os.path.exists(os.path.join(cfg.OUTPUT_DIR, 'models', safe_name(m.name), 'DONE'))]
         self.summaries = {m.name: json.load(open(os.path.join(cfg.model_dir(m.name), 'summary.json')))
                           for m in self.models}
+        for name, s in self.summaries.items():
+            if 'variant' not in s:   # summary written by an older pipeline version
+                logger.warning(f"[{name}] summary.json has no 'variant' — classified as "
+                               f"'{next(m.variant for m in self.models if m.name == name)}' from Config")
+                s['variant'] = next(m.variant for m in self.models if m.name == name)
+                s.setdefault('base_of', next(m.base_of for m in self.models if m.name == name))
 
     def table(self, name) -> pd.DataFrame:
         parts = [pd.read_csv(p) for m in self.models
@@ -2570,11 +2667,14 @@ class Aggregator:
 
     # ── confirmatory family across models ───────────────────────────────────
     def variant(self, model: str) -> str:
-        return self.summaries[model].get('variant', 'base')
+        return self.summaries[model]['variant']
 
     def confirmatory(self):
         """Holm across models per hypothesis, separately for base models (the
-        headline family) and instruct variants (robustness family)."""
+        headline family) and instruct variants (robustness family), plus a
+        stricter POOLED Holm over all models per hypothesis
+        (p_holm_all_models / supported_all_models) for readers who treat both
+        families as one."""
         c = self.table('confirmatory_tests')
         if c.empty:
             return
@@ -2583,10 +2683,15 @@ class Aggregator:
         for _, g in c.groupby(['variant', 'hypothesis']):
             c.loc[g.index, 'p_holm_across_models'] = adjust_pvalues(g['p'].to_numpy(), 'holm', self.cfg.ALPHA)
         c['supported_across_models'] = (c['p_holm_across_models'] < self.cfg.ALPHA) & (c['estimate'] > 0)
+        c['p_holm_all_models'] = np.nan
+        for _, g in c.groupby('hypothesis'):
+            c.loc[g.index, 'p_holm_all_models'] = adjust_pvalues(g['p'].to_numpy(), 'holm', self.cfg.ALPHA)
+        c['supported_all_models'] = (c['p_holm_all_models'] < self.cfg.ALPHA) & (c['estimate'] > 0)
         self.save(c, 'confirmatory_tests_all_models')
         s = c.groupby(['variant', 'hypothesis']).agg(n_models=('model', 'nunique'),
                                         n_supported_within_model=('supported', 'sum'),
                                         n_supported_across_models=('supported_across_models', 'sum'),
+                                        n_supported_pooled_holm=('supported_all_models', 'sum'),
                                         median_estimate=('estimate', 'median')).reset_index()
         self.save(s, 'confirmatory_summary')
         logger.info("confirmatory summary:\n" + s.to_string(index=False))
@@ -2644,46 +2749,86 @@ class Aggregator:
         self.save(pd.DataFrame(out), 'scaling_regression')
 
     # ── RQ5 — base vs instruct counterparts (I9) ────────────────────────────
+    def _evaluation_scores(self, model: str):
+        """Out-of-fold P(WORD) at the model's confirmatory layer for the
+        EVALUATION-half items, keyed by stimulus (identical item set for all
+        models, so two models can be compared item by item)."""
+        d = self.cfg.model_dir(model)
+        it = pd.read_csv(os.path.join(d, 'items_with_model_covariates.csv'))
+        z = np.load(os.path.join(d, 'oof_primary.npz'), allow_pickle=True)
+        p = pd.Series(z[f"L{self.summaries[model]['confirmatory_layer']}"], index=z['stimulus'])
+        ev = it[it['split'] == 'evaluation'].set_index('stimulus')
+        return ev.assign(p=p.reindex(ev.index).to_numpy())
+
     def base_vs_instruct(self):
-        """For every instruct variant whose base model finished: difference of
-        each confirmatory estimate, of the peak AUROC and of the depth of the
-        peak, plus the correlation of the two normalised-depth AUROC curves."""
+        """For every instruct variant whose base model finished.
+        Inferential (paired item bootstrap over the SAME evaluation items, each
+        model at its own confirmatory layer, Holm across pairs): instruct − base
+        for AUROC (H1a) and for the frequency effect ΔAUROC (H2).
+        Descriptive (no CI — they require refitting per resample): the
+        differences of the other confirmatory estimates, peak AUROC / depth and
+        the correlation of the two depth curves (first differences)."""
         c, lp = self.table('confirmatory_tests'), self.table('layers_primary')
         if c.empty or lp.empty:
             return
         rows = []
+        rng = np.random.RandomState(SEED + 301)
         for m, s in self.summaries.items():
-            b = s.get('base_of')
+            b = s['base_of']
             if self.variant(m) != 'instruct' or b not in self.summaries:
                 continue
             r = {'instruct_model': m, 'base_model': b}
+            eb, ei = self._evaluation_scores(b), self._evaluation_scores(m)
+            ei = ei.reindex(eb.index)
+            y, fg = eb['is_word'].to_numpy(), eb['freq_group'].to_numpy()
+            pb, pi = eb['p'].to_numpy(), ei['p'].to_numpy()
+            groups = {g: np.where(msk)[0] for g, msk in
+                      (('nw', y == 0), ('hf', fg == 'high'), ('lf', fg == 'low'), ('w', y == 1))}
+
+            def stats_(idx):
+                out = []
+                for p in (pi, pb):
+                    a = auc_with_ci(p[idx['w']], p[idx['nw']])['auroc']
+                    f = (auc_with_ci(p[idx['hf']], p[idx['nw']])['auroc']
+                         - auc_with_ci(p[idx['lf']], p[idx['nw']])['auroc'])
+                    out.append((a, f))
+                return out[0][0] - out[1][0], out[0][1] - out[1][1]
+            obs = stats_(groups)
+            boot = np.array([stats_({g: rng.choice(ix, len(ix)) for g, ix in groups.items()})
+                             for _ in range(self.cfg.N_BOOTSTRAP)])
+            for k, name in enumerate(('H1a_auroc', 'H2_delta_auroc')):
+                bk = boot[:, k]
+                r.update({f'{name}_instruct_minus_base': float(obs[k]),
+                          f'{name}_ci95_low': float(np.percentile(bk, 2.5)),
+                          f'{name}_ci95_high': float(np.percentile(bk, 97.5)),
+                          f'{name}_p_bootstrap': float(min(1.0, 2 * min(np.mean(bk <= 0), np.mean(bk >= 0))))})
             for h in sorted(c['hypothesis'].unique()):
-                ei = c[(c['model'] == m) & (c['hypothesis'] == h)]['estimate']
-                eb = c[(c['model'] == b) & (c['hypothesis'] == h)]['estimate']
-                if len(ei) and len(eb):
-                    r.update({f'{h}_base': float(eb.iloc[0]), f'{h}_instruct': float(ei.iloc[0]),
-                              f'{h}_instruct_minus_base': float(ei.iloc[0] - eb.iloc[0])})
-            gi = lp[lp['model'] == m].sort_values('layer')
-            gb = lp[lp['model'] == b].sort_values('layer')
-            grid = np.linspace(0, 1, self.cfg.CURVE_GRID)
-            ci = np.interp(grid, gi['relative_depth'], gi['auroc'])
-            cb = np.interp(grid, gb['relative_depth'], gb['auroc'])
+                vi = c[(c['model'] == m) & (c['hypothesis'] == h)]['estimate']
+                vb = c[(c['model'] == b) & (c['hypothesis'] == h)]['estimate']
+                if len(vi) and len(vb):
+                    r.update({f'{h}_base': float(vb.iloc[0]), f'{h}_instruct': float(vi.iloc[0]),
+                              f'{h}_instruct_minus_base_descriptive': float(vi.iloc[0] - vb.iloc[0])})
+            pair = lp[lp['model'].isin([m, b])]
+            _, curves = common_depth_curves(pair, 'auroc', self.cfg.CURVE_GRID)
+            gi, gb = pair[pair['model'] == m], pair[pair['model'] == b]
             r.update({'peak_auroc_base': float(gb['auroc'].max()), 'peak_auroc_instruct': float(gi['auroc'].max()),
                       'peak_depth_base': float(gb.loc[gb['auroc'].idxmax(), 'relative_depth']),
                       'peak_depth_instruct': float(gi.loc[gi['auroc'].idxmax(), 'relative_depth']),
-                      'curve_r_first_differences': float(np.corrcoef(np.diff(ci), np.diff(cb))[0, 1])})
+                      'curve_r_first_differences_descriptive': float(np.corrcoef(np.diff(curves[m]),
+                                                                                 np.diff(curves[b]))[0, 1])})
             rows.append(r)
         if rows:
-            self.save(pd.DataFrame(rows), 'base_vs_instruct')
+            df = pd.DataFrame(rows)
+            for name in ('H1a_auroc', 'H2_delta_auroc'):
+                df[f'{name}_p_holm_across_pairs'] = adjust_pvalues(df[f'{name}_p_bootstrap'].to_numpy(), 'holm')
+            self.save(df, 'base_vs_instruct')
 
     # ── RQ5 — alignment of normalised-depth curves ──────────────────────────
     def curve_alignment(self):
         lp = self.table('layers_primary')
         if lp.empty or lp['model'].nunique() < 2:
             return
-        grid = np.linspace(0, 1, self.cfg.CURVE_GRID)
-        curves = {m: np.interp(grid, (g['layer'] / max(g['layer'].max(), 1)).to_numpy(), g['auroc'].to_numpy())
-                  for m, g in lp.sort_values('layer').groupby('model')}
+        _, curves = common_depth_curves(lp, 'auroc', self.cfg.CURVE_GRID)
         names = list(curves)
         rows = []
         for i, a in enumerate(names):
@@ -2944,7 +3089,7 @@ class Aggregator:
             fig.tight_layout(); fig.savefig(os.path.join(fd, 'F6_prompt_robustness.png'), dpi=250); plt.close(fig)
 
         pairs = [(m, s['base_of']) for m, s in self.summaries.items()
-                 if self.variant(m) == 'instruct' and s.get('base_of') in self.summaries]
+                 if self.variant(m) == 'instruct' and s['base_of'] in self.summaries]
         if pairs and not lp_all.empty:
             fig, ax = plt.subplots(figsize=(10, 6))
             for m, b in pairs:
@@ -3053,6 +3198,8 @@ def run_self_tests(verbose: bool = True) -> bool:
             self.assertTrue(np.isfinite(p_correlation(0.9999, 10 ** 5)[1]))
             self.assertAlmostEqual(p_from_z(1.959963985)[0], 0.05, places=6)
             self.assertAlmostEqual(p_from_f(4.0, 1, 50)[0], p_from_t(2.0, 50)[0], places=8)
+            self.assertAlmostEqual(p_from_t_greater(2.0, 50)[0], stats.t.sf(2.0, 50), places=10)
+            self.assertAlmostEqual(p_from_t_greater(-2.0, 50)[0], stats.t.sf(-2.0, 50), places=10)
 
         def test_auc_and_delong(self):
             r = rng0(1)
@@ -3162,7 +3309,11 @@ def run_self_tests(verbose: bool = True) -> bool:
             pr = Prober(Config(DEVICE='cpu', PROBE_BACKEND='sklearn'))
             y_null = Z @ np.array([1.0, -0.5]) + 0.5 * r.normal(size=n)
             out0 = pr.crossfit_ridge_r2(X, y_null, folds, baseline=Z)
-            self.assertLess(abs(out0['delta_r2_beyond_baseline']), 0.02)
+            # Under H0, h adds only noise: out-of-fold ΔR² must not be positive
+            # beyond sampling error and the paired error test must not reject.
+            # (Ridge on 20 pure-noise features costs ≲ 0.01 out-of-fold R² here.)
+            self.assertLess(out0['delta_r2_beyond_baseline'], 0.01)
+            self.assertGreater(out0['p_beyond_baseline'], 0.01)
             y_alt = y_null + X[:, 0]
             out1 = pr.crossfit_ridge_r2(X, y_alt, folds, baseline=Z)
             self.assertGreater(out1['delta_r2_beyond_baseline'], 0.2)
@@ -3201,6 +3352,34 @@ def run_self_tests(verbose: bool = True) -> bool:
                 self.assertTrue(items.loc[items['is_word'] == 0, 'concreteness'].isna().all())
                 self.assertTrue(items.loc[items['is_word'] == 1, 'concreteness'].notna().all())
                 self.assertIn('concreteness', claim_boundary(info)['word_covariates_controlled'])
+
+        def test_nested_ols_fixed_schema(self):
+            X = pd.DataFrame({'a': np.arange(50.0)})
+            bad = nested_ols(np.arange(50.0), X, pd.DataFrame({'S': np.ones(50)}))
+            good = nested_ols(np.arange(50.0) + rng0(10).normal(size=50), X,
+                              pd.DataFrame({'S': rng0(11).normal(size=50)}))
+            self.assertEqual(set(bad), set(NESTED_OLS_KEYS))
+            self.assertEqual(set(good), set(NESTED_OLS_KEYS))
+            self.assertTrue(np.isnan(bad['delta_r2']) and bad['note'])
+
+        def test_split_strata_and_depth_grid(self):
+            it = pd.DataFrame({'is_word': [1] * 6 + [0] * 4,
+                               'freq_group': ['high'] * 3 + ['low', 'low', 'unknown'] + ['nonword'] * 4})
+            st = split_strata(it)
+            self.assertTrue((st.value_counts() >= 2).all())
+            self.assertNotIn('1_mid', set(st))           # 'unknown' is never relabelled 'mid'
+            t = pd.DataFrame({'model': ['a'] * 4 + ['b'] * 2, 'layer': [0, 1, 2, 3, 0, 1],
+                              'relative_depth': [.25, .5, .75, 1, .5, 1], 'auroc': [.6, .7, .8, .9, .65, .85]})
+            grid, cur = common_depth_curves(t, 'auroc', 3)
+            self.assertAlmostEqual(grid[0], 0.5)
+            self.assertAlmostEqual(grid[-1], 1.0)
+            self.assertAlmostEqual(cur['a'][0], 0.7)
+
+        def test_causal_streams_independent(self):
+            a = CausalAnalyses._rng('steering').randn(3)
+            CausalAnalyses._rng('head_ablation').randn(100)
+            self.assertTrue(np.allclose(a, CausalAnalyses._rng('steering').randn(3)))
+            self.assertEqual(len(set(CausalAnalyses._STREAM.values())), len(CausalAnalyses._STREAM))
 
         def test_prompts(self):
             for name in PROMPT_TEMPLATES:

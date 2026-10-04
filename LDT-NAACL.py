@@ -27,18 +27,29 @@ RESEARCH QUESTIONS  (confirmatory = headline claims; everything else exploratory
              token count / model log-probability (no extreme-group inflation).
              Robustness: caliper-matched HF/LF sets, covariate-erased probe,
              single- vs multi-token strata.
+             All word covariates also include every supplied lexical norm
+             (morpheme count, morphological family size, AoA, concreteness …).
   RQ3 [confirmatory]  incremental validity for human LDT RTs
         H3   ΔR² of item-level lexical evidence S over a covariate model
              (HAL and, if present, SUBTLEX frequency; length; Ortho_N; token
-             count; model log-probability; AoA / bigram frequency if present)
-  RQ4 [exploratory]   use: steering, INLP subspace ablation, head ablation and
-                      attention knockout vs same-size random nulls, read out
-                      through the model's own logit(YES) − logit(NO)
+             count; the model's OUTPUT-level word log-probability; bigram
+             frequency and lexical norms if present). The output-level
+             log-probability is also tested on its own, so internal evidence is
+             contrasted with the output-probability baseline of surprisal work.
+  RQ4 [confirmatory H4 + exploratory]  use
+        H4   antisymmetric steering along the lexicality direction at the
+             selected layer, ½[m(+α) − m(−α)] of the model's own
+             m = logit(YES) − logit(NO), exceeds that of random directions
+             (direction fitted on the selection half, tested on the evaluation half).
+        exploratory: dose-response, INLP subspace ablation, head ablation,
+             attention mass / knockout, each against same-size random nulls.
   RQ5 [exploratory]   generality: normalised-depth alignment, linear CKA,
-                      lexicality-probe transfer through stitching maps, scale
+                      lexicality-probe transfer through stitching maps, scale,
+                      and BASE vs INSTRUCT counterparts (chat-template input)
   RQ6 [exploratory]   task frame: carrier sentences inside / outside the prompt
   Robustness [exploratory]  prompt paraphrases, swapped answer order, stimulus
-                      position; nonword RTs; layer-trajectory measures.
+                      position; nonword RTs; layer-trajectory measures;
+                      frequency DECODING beyond the LM-internal baseline.
 
   Layer selection for confirmatory tests is made on a stratified SELECTION
   half of the items; the confirmatory statistics are computed on the disjoint
@@ -208,6 +219,9 @@ class ModelConfig:
     model_id: str
     batch_size: int = 32
     family: str = ''
+    variant: str = 'base'           # 'base' | 'instruct'
+    base_of: str | None = None      # for instruct variants: name of the base counterpart
+    chat: bool = False              # wrap every input in the tokenizer's chat template
 
     def __post_init__(self):
         if not self.family:
@@ -215,7 +229,7 @@ class ModelConfig:
 
 
 def default_models() -> list[ModelConfig]:
-    spec = [('SmolLM2-360M', 'HuggingFaceTB/SmolLM2-360M', 'smollm'),
+    base = [('SmolLM2-360M', 'HuggingFaceTB/SmolLM2-360M', 'smollm'),
             ('SmolLM3-3B-Base', 'HuggingFaceTB/SmolLM3-3B-Base', 'smollm'),
             ('Qwen2.5-1.5B', 'Qwen/Qwen2.5-1.5B', 'qwen'),
             ('Qwen2.5-3B', 'Qwen/Qwen2.5-3B', 'qwen'),
@@ -224,7 +238,14 @@ def default_models() -> list[ModelConfig]:
             ('Llama-3.2-1B', 'meta-llama/Llama-3.2-1B', 'llama'),
             ('Llama-3.2-3B', 'meta-llama/Llama-3.2-3B', 'llama'),
             ('Llama-3.1-8B', 'meta-llama/Llama-3.1-8B', 'llama')]
-    return [ModelConfig(n, m, family=f) for n, m, f in spec]
+    instruct = [('SmolLM2-360M-Instruct', 'HuggingFaceTB/SmolLM2-360M-Instruct', 'smollm', 'SmolLM2-360M'),
+                ('Qwen2.5-1.5B-Instruct', 'Qwen/Qwen2.5-1.5B-Instruct', 'qwen', 'Qwen2.5-1.5B'),
+                ('Qwen2.5-3B-Instruct', 'Qwen/Qwen2.5-3B-Instruct', 'qwen', 'Qwen2.5-3B'),
+                ('Llama-3.2-1B-Instruct', 'meta-llama/Llama-3.2-1B-Instruct', 'llama', 'Llama-3.2-1B'),
+                ('Llama-3.2-3B-Instruct', 'meta-llama/Llama-3.2-3B-Instruct', 'llama', 'Llama-3.2-3B')]
+    return ([ModelConfig(n, m, family=f) for n, m, f in base] +
+            [ModelConfig(n, m, family=f, variant='instruct', base_of=b, chat=True)
+             for n, m, f, b in instruct])
 
 
 @dataclass
@@ -232,7 +253,19 @@ class Config:
     # ── data (ELP; Balota et al., 2007) ─────────────────────────────────────
     WORDS_PATH: str = 'Items.csv'
     NONWORDS_PATH: str = 'NonWord.csv'
-    AOA_PATH: str | None = None          # optional CSV with columns Word, AoA (Kuperman et al., 2012)
+    # Lexical norms that are WORD properties (undefined for pseudowords). They
+    # enter every word-level covariate set when ≥ NORM_MIN_COVERAGE of the
+    # sampled words have a value. ELP columns are renamed; external files are
+    # merged on the lower-cased word, e.g.
+    #   {'path': 'MorphoLEX_en.csv', 'word_column': 'Word',
+    #    'columns': {'PFMF': 'morph_family_frequency', 'FamSize': 'morph_family_size'}}
+    #   {'path': 'AoA_Kuperman2012.csv', 'word_column': 'Word', 'columns': {'Rating.Mean': 'aoa'}}
+    #   {'path': 'Concreteness_Brysbaert2014.csv', 'word_column': 'Word',
+    #    'columns': {'Conc.M': 'concreteness'}}
+    ELP_NORM_COLUMNS: dict = field(default_factory=lambda: {'NMorph': 'n_morphemes'})
+    LEXICAL_NORMS: list[dict] = field(default_factory=list)
+    NORM_MIN_COVERAGE: float = 0.8
+    MATCH_ON_NORMS: list[str] = field(default_factory=lambda: ['n_morphemes', 'morph_family_size'])
     MAX_ITEMS: int | None = None         # None → all items (balanced words / nonwords)
     WORD_RT_COLUMN: str = 'I_Mean_RT'
     WORD_ACC_COLUMN: str = 'I_Mean_Accuracy'
@@ -278,6 +311,7 @@ class Config:
     RUN_PROMPT_ROBUSTNESS: bool = True            # I3
     RUN_CAUSAL: bool = True                       # RQ4
     RUN_CONTEXTUAL: bool = True                   # RQ6
+    RUN_INSTRUCT_VARIANTS: bool = True            # RQ5: instruct counterparts of base models
     LAYER_MODE_MLP: str = 'all'                   # 'all' | 'representative'
     LAYER_MODE_ERASURE: str = 'representative'
     LAYER_MODE_CONTROLS: str = 'representative'   # label permutation
@@ -288,7 +322,9 @@ class Config:
     CAUSAL_FIT_MAX_ITEMS: int = 20000
     CAUSAL_MAX_LAYERS: int = 4
     CAUSAL_BATCH_SIZE: int = 16
-    CAUSAL_N_RANDOM: int = 50                     # I6: empirical p floor = 1/51
+    CAUSAL_N_RANDOM: int = 50                     # I6: empirical p floor = 1/51 (exploratory)
+    H4_ALPHA: float = 2.0                         # confirmatory steering magnitude (SD units)
+    H4_N_NULL: int = 300                          # random directions → p floor 1/301
     STEERING_MAGNITUDES: list[float] = field(default_factory=lambda: [-4.0, -2.0, 2.0, 4.0])
     SUBSPACE_RANK: int = 4
     HEAD_TOP_K: int = 10
@@ -328,6 +364,11 @@ class Config:
         need(0 < self.LEXICAL_EVIDENCE_CLIP < 0.5, "LEXICAL_EVIDENCE_CLIP")
         need(self.REP_DTYPE in ('float32', 'float16'), "REP_DTYPE")
         need(0 <= self.RT_MIN_ACCURACY < 1, "RT_MIN_ACCURACY in [0, 1)")
+        need(0 < self.NORM_MIN_COVERAGE <= 1, "NORM_MIN_COVERAGE in (0, 1]")
+        need(self.H4_ALPHA > 0, "H4_ALPHA > 0")
+        for nd in self.LEXICAL_NORMS:
+            need(isinstance(nd, dict) and {'path', 'word_column', 'columns'} <= set(nd),
+                 "LEXICAL_NORMS entries need path, word_column, columns")
         need(0 < self.TRANSFER_TEST_FRACTION < 0.9, "TRANSFER_TEST_FRACTION")
         need(all(0 < d <= 1 for d in self.TRANSFER_DEPTHS), "TRANSFER_DEPTHS in (0, 1]")
         need(0 not in self.STEERING_MAGNITUDES and len(self.STEERING_MAGNITUDES) > 0,
@@ -337,7 +378,7 @@ class Config:
         for n in ('N_BOOTSTRAP', 'MIN_GROUP', 'PROMPT_ROBUSTNESS_N_ITEMS', 'CAUSAL_N_ITEMS',
                   'CAUSAL_MAX_LAYERS', 'CAUSAL_BATCH_SIZE', 'CAUSAL_N_RANDOM', 'SUBSPACE_RANK',
                   'HEAD_TOP_K', 'CONTEXT_N_ITEMS', 'TRANSFER_N_ITEMS', 'CKA_N_ITEMS',
-                  'CURVE_GRID', 'RT_MIN_ITEMS', 'MLP_EPOCHS', 'MLP_BATCH_SIZE'):
+                  'CURVE_GRID', 'RT_MIN_ITEMS', 'MLP_EPOCHS', 'MLP_BATCH_SIZE', 'H4_N_NULL'):
             v = getattr(self, n)
             need(isinstance(v, int) and not isinstance(v, bool) and v >= 1, f"{n} positive int")
         need(self.CONTEXT_SENTENCE.count('{}') == 1, "CONTEXT_SENTENCE needs one {}")
@@ -346,6 +387,9 @@ class Config:
              self.CONTEXT_TASK_TEMPLATE.count('{STIMULUS}') == 1, "CONTEXT_TASK_TEMPLATE fields")
         names = [m.name for m in self.MODELS]
         need(len(names) == len(set(names)) and names, "unique, non-empty model names")
+        for m in self.MODELS:
+            need(m.variant in ('base', 'instruct'), f"{m.name}: variant base|instruct")
+            need(m.base_of is None or m.base_of in names, f"{m.name}: base_of not in MODELS")
         return self
 
     def dirs(self) -> dict:
@@ -755,6 +799,8 @@ def load_items(cfg: Config) -> tuple[pd.DataFrame, dict]:
                     info['subtlex_column'] = c
                     break
         out['bigram_mean'] = _numeric(df[cfg.BIGRAM_COLUMN]) if cfg.BIGRAM_COLUMN in df else np.nan
+        for src, dst in cfg.ELP_NORM_COLUMNS.items():
+            out[dst] = _numeric(df[src]) if (is_word and src in df) else np.nan
         return out[out['stimulus'].str.fullmatch(r'[a-z]+', na=False)]
 
     words, nonwords = _frame(wdf, True), _frame(ndf, False)
@@ -765,15 +811,16 @@ def load_items(cfg: Config) -> tuple[pd.DataFrame, dict]:
     info.update({'n_words_file': len(words), 'n_nonwords_file': len(nonwords),
                  'n_word_nonword_string_overlap_removed': len(overlap),
                  'subtlex_column': info.get('subtlex_column')})
-    if cfg.AOA_PATH and os.path.exists(cfg.AOA_PATH):
-        aoa = pd.read_csv(cfg.AOA_PATH)
-        aoa = aoa.assign(stimulus=aoa['Word'].astype(str).str.lower(),
-                         aoa=_numeric(aoa['AoA']))[['stimulus', 'aoa']].drop_duplicates('stimulus')
-        words = words.merge(aoa, on='stimulus', how='left')
-        info['aoa_matched'] = int(words['aoa'].notna().sum())
-    else:
-        words['aoa'] = np.nan
-    nonwords['aoa'] = np.nan
+    norm_names = list(cfg.ELP_NORM_COLUMNS.values())
+    for nd in cfg.LEXICAL_NORMS:
+        ext = pd.read_csv(nd['path'])
+        ext = pd.DataFrame({'stimulus': ext[nd['word_column']].astype(str).str.strip().str.lower(),
+                            **{dst: _numeric(ext[src]) for src, dst in nd['columns'].items()}})
+        words = words.drop(columns=[c for c in nd['columns'].values() if c in words])
+        words = words.merge(ext.drop_duplicates('stimulus'), on='stimulus', how='left')
+        norm_names += [c for c in nd['columns'].values() if c not in norm_names]
+    for c in norm_names:
+        nonwords[c] = np.nan                       # word properties: undefined for pseudowords
 
     n = min(len(words), len(nonwords))
     if cfg.MAX_ITEMS is not None:
@@ -794,6 +841,10 @@ def load_items(cfg: Config) -> tuple[pd.DataFrame, dict]:
                               stratify=strata, random_state=SEED)
     items['split'] = 'evaluation'
     items.loc[sel, 'split'] = 'selection'
+    wmask = items['is_word'] == 1
+    info['word_norms_available'] = [c for c in norm_names
+                                    if items.loc[wmask, c].notna().mean() >= cfg.NORM_MIN_COVERAGE]
+    info['word_norms_coverage'] = {c: float(items.loc[wmask, c].notna().mean()) for c in norm_names}
     info.update({'n_items': len(items), 'n_per_class': n,
                  'hal_tertile_cutoffs': {'high_ge': float(hi), 'low_le': float(lo)},
                  'n_high': int((items['freq_group'] == 'high').sum()),
@@ -906,6 +957,8 @@ class LanguageModel:
             dtype = torch.float32
         self.dtype = dtype
         dkey = 'dtype' if TRANSFORMERS_VERSION >= (4, 56, 0) else 'torch_dtype'
+        if mc.chat and not tok.chat_template:
+            raise RuntimeError(f"{mc.name}: chat=True but the tokenizer has no chat template")
         if self.random_init:
             seed_everything(SEED)
             model = AutoModelForCausalLM.from_config(
@@ -1019,12 +1072,28 @@ class LanguageModel:
                 'no_tokens': [self.tokenizer.decode([i]) for i in self.no_ids[:10]]}
 
     # ── tokenisation and forward ────────────────────────────────────────────
+    def format(self, text: str, span=None):
+        """Instruct variants: the task text becomes the user turn of the model's
+        own chat template with the generation prompt appended, so the decision
+        site is the first assistant position. Spans are shifted accordingly."""
+        if not self.mc.chat:
+            return text, span
+        f = self.tokenizer.apply_chat_template([{'role': 'user', 'content': text}],
+                                               tokenize=False, add_generation_prompt=True)
+        off = f.find(text)
+        if off < 0:
+            raise RuntimeError(f"{self.mc.name}: chat template altered the task text")
+        return f, (None if span is None else (span[0] + off, span[1] + off))
+
     def encode(self, texts: list[str], spans=None):
         """Left-padded batch; `fp` = decision site (last non-pad token), verified
         per row; `span_mask` marks the tokens overlapping each character span."""
         want = spans is not None
+        pairs = [self.format(t, None if spans is None else spans[i]) for i, t in enumerate(texts)]
+        texts = [p[0] for p in pairs]
+        spans = [p[1] for p in pairs] if want else None
         enc = self.tokenizer(list(texts), return_tensors='pt', padding=True, truncation=False,
-                             add_special_tokens=True, return_offsets_mapping=want)
+                             add_special_tokens=not self.mc.chat, return_offsets_mapping=want)
         ids = enc['input_ids'].to(self.device)
         am = enc['attention_mask'].to(self.device)
         T = am.shape[1]
@@ -1157,6 +1226,7 @@ class LanguageModel:
 
     def describe(self) -> dict:
         return {'model': self.mc.name, 'model_id': self.mc.model_id, 'family': self.mc.family,
+                'variant': self.mc.variant, 'base_of': self.mc.base_of, 'chat_template_input': self.mc.chat,
                 'random_init': self.random_init, 'num_layers': self.num_layers,
                 'hidden_dim': self.hidden_dim, 'n_parameters': self.n_parameters,
                 'dtype': str(self.dtype), 'tokenizer': type(self.tokenizer).__name__,
@@ -1334,28 +1404,50 @@ class Prober:
                 raise ValueError(kind)
         return oof
 
-    def crossfit_ridge_r2(self, X, y, folds, alphas=(1.0, 10.0, 100.0, 1e3, 1e4)) -> dict:
-        """Cross-fitted ridge decoding of a continuous target (log frequency):
-        alpha chosen on an inner 20% split of each training fold; R² and
-        Spearman ρ on out-of-fold predictions."""
+    def crossfit_ridge_r2(self, X, y, folds, baseline, alphas=(1.0, 10.0, 100.0, 1e3, 1e4)) -> dict:
+        """Cross-fitted decoding of a continuous target (log frequency).
+          baseline : OLS on the baseline covariates (fitted per training fold)
+          hidden   : ridge on the hidden state alone
+          combined : baseline OLS + ridge on h fitted to the baseline RESIDUAL
+        Ridge alpha is chosen on an inner 20% split of each training fold.
+        ΔR² = R²(combined) − R²(baseline) on out-of-fold predictions, tested
+        with a paired t-test on per-item squared-error reductions."""
         X, y = np.asarray(X, np.float64), np.asarray(y, float)
-        pred = np.full(len(y), np.nan)
+        Zall = np.asarray(baseline, float)
+        pred_h, pred_b, pred_c = (np.full(len(y), np.nan) for _ in range(3))
         for k in np.unique(folds):
             te, tr = np.where(folds == k)[0], np.where(folds != k)[0]
             mu, sd = standardize_fit(X[tr])
             Xtr, Xte = (X[tr] - mu) / sd, (X[te] - mu) / sd
-            ym = y[tr].mean()
-            inner = np.random.default_rng(SEED + int(k)).permutation(len(tr))
-            a_, b_ = inner[len(tr) // 5:], inner[:len(tr) // 5]
-
-            def _solve(A, t, alpha):
-                return np.linalg.solve(A.T @ A + alpha * np.eye(A.shape[1]), A.T @ t)
-            best = min(alphas, key=lambda al: np.mean(
-                (Xtr[b_] @ _solve(Xtr[a_], y[tr][a_] - ym, al) + ym - y[tr][b_]) ** 2))
-            pred[te] = Xte @ _solve(Xtr, y[tr] - ym, best) + ym
+            zm, zs = standardize_fit(Zall[tr])
+            A_tr = np.column_stack([np.ones(len(tr)), (Zall[tr] - zm) / zs])
+            A_te = np.column_stack([np.ones(len(te)), (Zall[te] - zm) / zs])
+            beta, *_ = np.linalg.lstsq(A_tr, y[tr], rcond=None)
+            pred_b[te] = A_te @ beta
+            resid = y[tr] - A_tr @ beta
+            pred_h[te] = self._ridge_fit_predict(Xtr, y[tr], Xte, alphas, int(k))
+            pred_c[te] = pred_b[te] + self._ridge_fit_predict(Xtr, resid, Xte, alphas, int(k))
         ss = np.sum((y - y.mean()) ** 2)
-        rho, _ = stats.spearmanr(pred, y)
-        return {'r2_oof': float(1 - np.sum((y - pred) ** 2) / ss), 'spearman_oof': float(rho)}
+        r2 = lambda p: float(1 - np.sum((y - p) ** 2) / ss)
+        gain = (y - pred_b) ** 2 - (y - pred_c) ** 2
+        p, lp = p_from_t(gain.mean() / (gain.std(ddof=1) / np.sqrt(len(gain))), len(gain) - 1)
+        return {'n': int(len(y)), 'r2_baseline': r2(pred_b), 'r2_hidden': r2(pred_h),
+                'r2_combined': r2(pred_c), 'delta_r2_beyond_baseline': r2(pred_c) - r2(pred_b),
+                'spearman_hidden': float(stats.spearmanr(pred_h, y)[0]),
+                'p_beyond_baseline': p, 'p_beyond_baseline_log10': lp}
+
+    @staticmethod
+    def _ridge_fit_predict(Xtr, ytr, Xte, alphas, seed) -> np.ndarray:
+        """Ridge on standardised features; alpha chosen on an inner 20% split."""
+        ym = ytr.mean()
+        inner = np.random.default_rng(SEED + seed).permutation(len(ytr))
+        a_, b_ = inner[len(ytr) // 5:], inner[:len(ytr) // 5]
+
+        def solve(A, t, alpha):
+            return np.linalg.solve(A.T @ A + alpha * np.eye(A.shape[1]), A.T @ t)
+        best = min(alphas, key=lambda al: np.mean(
+            (Xtr[b_] @ solve(Xtr[a_], ytr[a_] - ym, al) + ym - ytr[b_]) ** 2))
+        return Xte @ solve(Xtr, ytr - ym, best) + ym
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1508,10 +1600,11 @@ def raw_direction(probe: dict) -> np.ndarray:
 
 
 class CausalAnalyses:
-    """Interventions at the DECISION SITE of ONE layer; directions / probes are
-    fitted on items DISJOINT from the evaluation items; outcome is the model's
-    own final-layer m = logit(YES) − logit(NO). Every effect is compared with
-    CAUSAL_N_RANDOM same-size random directions / subspaces / heads / tokens."""
+    """Interventions at the DECISION SITE of ONE layer. Directions / probes are
+    fitted on SELECTION-half items, effects are measured on EVALUATION-half
+    items; outcome is the model's own final-layer m = logit(YES) − logit(NO).
+    Every effect is compared with same-size random directions / subspaces /
+    heads / tokens."""
 
     def __init__(self, lm: LanguageModel, items: pd.DataFrame, reps: dict, prober: Prober,
                  cfg: Config, layers: list[int], readout_layer: int):
@@ -1524,11 +1617,14 @@ class CausalAnalyses:
             idx = np.where(mask)[0]
             return rng.choice(idx, size=min(k, len(idx)), replace=False) if len(idx) else idx
         n = cfg.CAUSAL_N_ITEMS
-        ev = np.concatenate([take((y == 1) & (fg == 'high'), n // 6), take((y == 1) & (fg == 'low'), n // 6),
-                             take((y == 1) & (fg == 'mid'), n // 2 - 2 * (n // 6)), take(y == 0, n - n // 2)])
+        is_ev = (items['split'] == 'evaluation').to_numpy()
+        ev = np.concatenate([take(is_ev & (y == 1) & (fg == 'high'), n // 6),
+                             take(is_ev & (y == 1) & (fg == 'low'), n // 6),
+                             take(is_ev & (y == 1) & (fg == 'mid'), n // 2 - 2 * (n // 6)),
+                             take(is_ev & (y == 0), n - n // 2)])
         self.ev = np.sort(ev)
-        rest = np.setdiff1d(np.arange(len(items)), self.ev)
-        self.fit = np.sort(rng.choice(rest, size=min(cfg.CAUSAL_FIT_MAX_ITEMS, len(rest)), replace=False))
+        sel = np.where(~is_ev)[0]
+        self.fit = np.sort(rng.choice(sel, size=min(cfg.CAUSAL_FIT_MAX_ITEMS, len(sel)), replace=False))
         self.y, self.fg = y[self.ev], fg[self.ev]
         self.texts = [build_prompt(s)[0] for s in items['stimulus'].to_numpy()[self.ev]]
         self.spans = [build_prompt(s)[1] for s in items['stimulus'].to_numpy()[self.ev]]
@@ -1614,16 +1710,49 @@ class CausalAnalyses:
                 null = [float(np.mean(shift(u) - m0)) for u in rand]
                 for name, u in dirs.items():
                     d = shift(u) - m0
-                    p_t, lp_t = p_from_t(d.mean() / (d.std(ddof=1) / np.sqrt(len(d))), len(d) - 1)
                     rows.append({'layer': li, 'relative_depth': (li + 1) / self.lm.num_layers,
                                  'direction': name, 'alpha_sd': alpha, 'n_items': len(d),
                                  'baseline_accuracy': base['accuracy'],
                                  'mean_delta_margin': float(d.mean()),
                                  'mean_delta_margin_words': float(d[self.y == 1].mean()),
                                  'mean_delta_margin_nonwords': float(d[self.y == 0].mean()),
-                                 'p_paired_t': p_t, 'p_paired_t_log10': lp_t,
                                  **self._vs_null(float(d.mean()), null)})
         return rows
+
+    def confirmatory_steering(self) -> dict:
+        """H4. At the confirmatory layer R, the antisymmetric steering effect
+            T(u) = mean_i ½[m_i(h + α s u) − m_i(h − α s u)]
+        for the lexicality direction u (positive = towards WORD) versus
+        H4_N_NULL random unit directions scaled by their own projection SD.
+        The antisymmetric contrast cancels any direction-independent effect of
+        perturbing the residual stream. Because u and −u are equally likely
+        under the random-direction null, that null is symmetric about 0, so
+        p = (1 + #{|T_null| ≥ |T|}) / (1 + N). No item-level t-test is reported:
+        it only tests T ≠ 0, which ANY direction satisfies, not specificity."""
+        R, a = self.R, self.cfg.H4_ALPHA
+        X, spaces = self._directions(R)
+        u = raw_direction(self.prober.fit_linear(*spaces['lexicality']))
+
+        def contrast(v):
+            s = float(np.std(X @ v))
+            vt = torch.as_tensor(a * s * v, dtype=torch.float32)
+            mp = self._margins(self._layer_hook(R, lambda h: h + vt.to(h.device)))
+            mn = self._margins(self._layer_hook(R, lambda h: h - vt.to(h.device)))
+            return 0.5 * (mp - mn)
+        d = contrast(u)
+        null = []
+        for _ in tqdm(range(self.cfg.H4_N_NULL), desc=f"H4 null | {self.lm.mc.name}", leave=False):
+            r = self.rng.randn(X.shape[1])
+            null.append(float(contrast(r / np.linalg.norm(r)).mean()))
+        null = np.asarray(null)
+        T = float(d.mean())
+        lo, hi = bootstrap_mean_ci(d, self.cfg.N_BOOTSTRAP)
+        return {'layer': R, 'alpha_sd': a, 'n_items': int(len(d)), 'n_null': int(len(null)),
+                'T': T, 'T_ci95_low': lo, 'T_ci95_high': hi,
+                'T_words': float(d[self.y == 1].mean()), 'T_nonwords': float(d[self.y == 0].mean()),
+                'null_mean': float(null.mean()), 'null_sd': float(null.std(ddof=1)),
+                'z_vs_null': float((T - null.mean()) / null.std(ddof=1)) if null.std(ddof=1) > 0 else np.nan,
+                'p_random_direction': float((1 + np.sum(np.abs(null) >= abs(T))) / (1 + len(null)))}
 
     def subspace_ablation(self) -> list[dict]:
         """h ← h − UUᵀ(h − μ): mean-ablation of a rank-k INLP subspace; null =
@@ -1822,13 +1951,14 @@ class ModelStudy:
     """Runs every per-model analysis and writes it to OUTPUT_DIR/models/<model>/.
     A model is complete when its DONE file exists (resumable)."""
 
-    def __init__(self, mc: ModelConfig, cfg: Config, items: pd.DataFrame):
+    def __init__(self, mc: ModelConfig, cfg: Config, items: pd.DataFrame, word_norms: list[str]):
         self.mc, self.cfg = mc, cfg
         self.items = items.copy()
+        self.word_norms = list(word_norms)
         self.dir = cfg.model_dir(mc.name)
         self.prober = Prober(cfg)
-        self.tables: dict[str, list] = {}
-        self.summary: dict = {'model': mc.name, 'family': mc.family}
+        self.summary: dict = {'model': mc.name, 'family': mc.family, 'variant': mc.variant,
+                              'base_of': mc.base_of, 'word_norms_used': self.word_norms}
 
     # ── helpers ─────────────────────────────────────────────────────────────
     @property
@@ -1840,7 +1970,6 @@ class ModelStudy:
         return self.items['freq_group'].to_numpy(object)
 
     def _save(self, name, rows):
-        self.tables[name] = rows
         pd.DataFrame(rows).to_csv(os.path.join(self.dir, f'{name}.csv'), index=False)
 
     def _tag(self, rows, **kw):
@@ -1887,8 +2016,7 @@ class ModelStudy:
         self._baselines(lm.tokenizer)
 
         # live-model analyses — the model is freed only after all of them
-        if cfg.RUN_CAUSAL:
-            self._causal(lm, reps)
+        self._causal(lm, reps)
         if cfg.RUN_PROMPT_ROBUSTNESS:
             self._prompt_robustness(lm, reps)
         if cfg.RUN_CONTEXTUAL:
@@ -1956,6 +2084,10 @@ class ModelStudy:
         layers = sorted(set(select_layers(self.L, 'representative', self.cfg.CAUSAL_MAX_LAYERS - 1))
                         | {self.best})
         ca = CausalAnalyses(lm, self.items, reps, self.prober, self.cfg, layers, self.best)
+        self.h4 = ca.confirmatory_steering()
+        self._save('confirmatory_h4_steering', self._tag([self.h4]))
+        if not self.cfg.RUN_CAUSAL:
+            return
         for name, fn in (('causal_steering', ca.steering), ('causal_subspace_ablation', ca.subspace_ablation)):
             try:
                 self._save(name, self._tag(fn()))
@@ -2119,7 +2251,10 @@ class ModelStudy:
     # ── RQ2 — frequency ─────────────────────────────────────────────────────
     def _frequency(self, reps):
         cfg, it, y, fg = self.cfg, self.items, self.y, self.fg
-        cov_names = ['length', 'ortho_n', 'token_count', 'word_logprob']
+        # word-level covariates: surface form, tokenisation, the model's own
+        # output-level log-probability and every available lexical norm
+        # (morphology, AoA, concreteness …) — G2.
+        cov_names = ['length', 'ortho_n', 'token_count', 'word_logprob'] + self.word_norms
         words = (y == 1) & it[['log_freq_hal'] + cov_names].notna().all(1).to_numpy()
         # (a) continuous slope — PRIMARY effect size (no extreme-group inflation)
         rows = []
@@ -2144,9 +2279,12 @@ class ModelStudy:
                 r[col + '_fdr'] = q
         self._save('frequency_continuous_slope', self._tag(rows))
 
-        # (b) caliper matching on length / Ortho_N / token count (B1–B3).
-        #     NOT on word_logprob: it is itself a frequency estimate.
-        mcov = ['length', 'ortho_n', 'token_count']
+        # (b) caliper matching on length / Ortho_N / token count and, when
+        #     supplied, morphology (B1–B3). NOT on word_logprob: it is itself a
+        #     frequency estimate. Erasure (c) uses only covariates defined for
+        #     pseudowords too.
+        ecov = ['length', 'ortho_n', 'token_count']
+        mcov = ecov + [n for n in cfg.MATCH_ON_NORMS if n in self.word_norms]
         hfi, lfi = np.where(fg == 'high')[0], np.where(fg == 'low')[0]
         feat = it[mcov].to_numpy(float)
         med = np.nanmedian(feat[np.r_[hfi, lfi]], 0)
@@ -2175,14 +2313,12 @@ class ModelStudy:
             for r, q in zip(mrows, adjust_pvalues([r['p_delta_auroc'] for r in mrows])):
                 r['p_delta_auroc_fdr'] = q
         self._save('frequency_matched_delta_auroc', self._tag(mrows))
-        self.matched = (m_hf, m_lf)
 
         # (c) covariate-erased probe (B4): lexicality and ΔAUROC without any
         #     linear information about length / Ortho_N / token count.
-        Zc = it[mcov].to_numpy(float)
+        Zc = it[ecov].to_numpy(float)
         layers = select_layers(self.L, cfg.LAYER_MODE_ERASURE) + [self.best]
         oof_e = self._crossfit_layers(reps, sorted(set(layers)), covariates=Zc, desc='covariate-erased')
-        self.oof_erased = oof_e
         self._save('layers_covariate_erased', self._tag(layer_table(
             oof_e, y, fg, cfg, {'representation': 'decision_site_minus_linear_covariates'}, self.L)))
         self._save('paired_erased_vs_primary', self._tag(paired_vs_reference(oof_e, self.oof, y, cfg)))
@@ -2198,21 +2334,28 @@ class ModelStudy:
                 srows.append({'layer': li, 'relative_depth': (li + 1) / self.L, 'stratum': name, **d})
         self._save('frequency_token_strata', self._tag(srows))
 
-        # (e) frequency DECODING from the decision site (encoding, not effect)
+        # (e) frequency DECODING from the decision site, and BEYOND the
+        #     LM-internal baseline (G5): does h carry frequency information that
+        #     the model's own output log-probability plus surface covariates and
+        #     norms do not?
         drows = []
-        wl = (y == 1) & it['log_freq_hal'].notna().to_numpy()
+        wl = words & it['log_freq_hal'].notna().to_numpy()
         hal = it.loc[wl, 'log_freq_hal']
         f_w = self.prober.folds((hal > hal.median()).astype(int).to_numpy())
+        Zb = it.loc[wl, cov_names].to_numpy(float)
         for li in select_layers(self.L, cfg.LAYER_MODE_CONTROLS):
             drows.append({'layer': li, 'relative_depth': (li + 1) / self.L,
-                          **self.prober.crossfit_ridge_r2(reps[li][wl], it.loc[wl, 'log_freq_hal'].to_numpy(), f_w)})
-        self._save('frequency_decoding_ridge', self._tag(drows))
+                          'baseline_covariates': '+'.join(cov_names),
+                          **self.prober.crossfit_ridge_r2(reps[li][wl], hal.to_numpy(), f_w, baseline=Zb)})
+        for r, q in zip(drows, adjust_pvalues([r['p_beyond_baseline'] for r in drows])):
+            r['p_beyond_baseline_fdr'] = q
+        self._save('frequency_decoding_beyond_lm_baseline', self._tag(drows))
 
     # ── RQ3 — human RT ──────────────────────────────────────────────────────
     def _rt_covariates(self, word: bool) -> list[str]:
         it = self.items[self.items['is_word'] == int(word)]
         base = ['length', 'ortho_n', 'token_count', 'word_logprob']
-        opt = ['log_freq_hal', 'subtlex', 'aoa', 'bigram_mean'] if word else ['bigram_mean']
+        opt = (['log_freq_hal', 'subtlex', 'bigram_mean'] + self.word_norms) if word else ['bigram_mean']
         return base + [c for c in opt if it[c].notna().mean() >= 0.8]
 
     def _rt_sample(self, word: bool, covs: list[str]) -> np.ndarray:
@@ -2267,6 +2410,24 @@ class ModelStudy:
             for r, q in zip(blk, adjust_pvalues([r['p_f'] for r in blk])):
                 r['p_f_fdr_within_model'] = q
         self._save('rt_incremental_validity', self._tag(rows))
+
+        # internal evidence vs the OUTPUT-level probability baseline (G5): the
+        # model's unconditional word log-probability (the quantity surprisal
+        # studies use) against the same covariates without it, next to the
+        # internal evidence S at the confirmatory layer with and without it.
+        S_best = self._evidence(self.oof[self.best])
+        lp = self.items['word_logprob'].to_numpy(float)
+        comp = []
+        for target, m, covs in (('words', wm, wc), ('nonwords', nm, nc)):
+            if m.sum() < cfg.RT_MIN_ITEMS:
+                continue
+            c0 = [c for c in covs if c != 'word_logprob']
+            for label, cv, pred in (('output_logprob_over_covariates', c0, lp),
+                                    ('internal_S_over_covariates', c0, S_best),
+                                    ('internal_S_over_covariates_and_output_logprob', covs, S_best)):
+                comp.append({'items': target, 'comparison': label, 'layer': self.best,
+                             'covariates': '+'.join(cv), **self._incremental(m, cv, pred)})
+        self._save('rt_internal_vs_output_probability', self._tag(comp))
 
         # trajectory measures over NORMALISED depth (I2; exploratory)
         d = (np.arange(self.L) + 1) / self.L
@@ -2356,6 +2517,12 @@ class ModelStudy:
                          'p': r['p_f'], 'p_log10': r['p_f_log10'], 'beta_std_S': r.get('beta_std'),
                          'p_hc3_S': r.get('p_hc3'), 'log10_bf01': r.get('log10_bf01'),
                          'bf01_label': r.get('log10_bf01_label'), 'n': r['n']})
+        h4 = self.h4
+        rows.append({'hypothesis': 'H4', 'test': (f"antisymmetric steering ½[m(+{h4['alpha_sd']}σu) − "
+                                                  f"m(−{h4['alpha_sd']}σu)] vs {h4['n_null']} random directions"),
+                     'estimate': h4['T'], 'ci95_low': h4['T_ci95_low'], 'ci95_high': h4['T_ci95_high'],
+                     'p': h4['p_random_direction'], 'p_log10': np.log10(h4['p_random_direction']),
+                     'z_vs_null': h4['z_vs_null'], 'n': h4['n_items']})
         for r, q in zip(rows, adjust_pvalues([r['p'] for r in rows], 'holm', cfg.ALPHA)):
             r.update({'layer': Lb, 'relative_depth': (Lb + 1) / self.L, 'items': 'evaluation_half',
                       'p_holm_within_model': q, 'supported': bool(finite(q) and q < cfg.ALPHA
@@ -2392,7 +2559,8 @@ class Aggregator:
             return
         logger.info(f"aggregating {len(self.models)} models: {[m.name for m in self.models]}")
         steps = [('confirmatory', self.confirmatory), ('global FDR', self.global_fdr),
-                 ('scaling', self.scaling), ('curve alignment', self.curve_alignment),
+                 ('scaling', self.scaling), ('base vs instruct', self.base_vs_instruct),
+                 ('curve alignment', self.curve_alignment),
                  ('CKA', self.cka), ('transfer', self.transfer), ('figures', self.figures)]
         for name, fn in steps:
             try:
@@ -2401,16 +2569,22 @@ class Aggregator:
                 logger.error(f"aggregation step {name} failed: {e}", exc_info=True)
 
     # ── confirmatory family across models ───────────────────────────────────
+    def variant(self, model: str) -> str:
+        return self.summaries[model].get('variant', 'base')
+
     def confirmatory(self):
+        """Holm across models per hypothesis, separately for base models (the
+        headline family) and instruct variants (robustness family)."""
         c = self.table('confirmatory_tests')
         if c.empty:
             return
+        c['variant'] = c['model'].map(self.variant)
         c['p_holm_across_models'] = np.nan
-        for h, g in c.groupby('hypothesis'):
+        for _, g in c.groupby(['variant', 'hypothesis']):
             c.loc[g.index, 'p_holm_across_models'] = adjust_pvalues(g['p'].to_numpy(), 'holm', self.cfg.ALPHA)
         c['supported_across_models'] = (c['p_holm_across_models'] < self.cfg.ALPHA) & (c['estimate'] > 0)
         self.save(c, 'confirmatory_tests_all_models')
-        s = c.groupby('hypothesis').agg(n_models=('model', 'nunique'),
+        s = c.groupby(['variant', 'hypothesis']).agg(n_models=('model', 'nunique'),
                                         n_supported_within_model=('supported', 'sum'),
                                         n_supported_across_models=('supported_across_models', 'sum'),
                                         median_estimate=('estimate', 'median')).reset_index()
@@ -2431,6 +2605,8 @@ class Aggregator:
                 rt.loc[g.index, 'p_f_fdr_global'] = adjust_pvalues(g['p_f'].to_numpy())
             self.save(rt, 'rt_incremental_validity_all_models')
         for name in ('frequency_continuous_slope', 'frequency_matched_delta_auroc',
+                     'frequency_decoding_beyond_lm_baseline', 'rt_internal_vs_output_probability',
+                     'confirmatory_h4_steering',
                      'layers_random_init', 'baselines_no_hidden_state', 'causal_steering',
                      'causal_subspace_ablation', 'causal_head_ablation', 'causal_attention_knockout',
                      'prompt_robustness_spread', 'contextual_frequency', 'rt_trajectory_measures',
@@ -2448,7 +2624,7 @@ class Aggregator:
         rows = [{'model': m, 'family': s['family'], 'log10_params': np.log10(s['n_parameters']),
                  'evaluation_auroc': a.loc[m, 'estimate'] if m in a.index else np.nan,
                  'confirmatory_relative_depth': s['confirmatory_layer_relative_depth']}
-                for m, s in self.summaries.items()]
+                for m, s in self.summaries.items() if self.variant(m) == 'base']
         d = pd.DataFrame(rows)
         self.save(d, 'scaling_points')
         if len(d) < 4:
@@ -2466,6 +2642,39 @@ class Aggregator:
                 r.update({'slope_within_family': tf['beta'], 'p_hc3_within_family': tf['p_hc3']})
             out.append(r)
         self.save(pd.DataFrame(out), 'scaling_regression')
+
+    # ── RQ5 — base vs instruct counterparts (I9) ────────────────────────────
+    def base_vs_instruct(self):
+        """For every instruct variant whose base model finished: difference of
+        each confirmatory estimate, of the peak AUROC and of the depth of the
+        peak, plus the correlation of the two normalised-depth AUROC curves."""
+        c, lp = self.table('confirmatory_tests'), self.table('layers_primary')
+        if c.empty or lp.empty:
+            return
+        rows = []
+        for m, s in self.summaries.items():
+            b = s.get('base_of')
+            if self.variant(m) != 'instruct' or b not in self.summaries:
+                continue
+            r = {'instruct_model': m, 'base_model': b}
+            for h in sorted(c['hypothesis'].unique()):
+                ei = c[(c['model'] == m) & (c['hypothesis'] == h)]['estimate']
+                eb = c[(c['model'] == b) & (c['hypothesis'] == h)]['estimate']
+                if len(ei) and len(eb):
+                    r.update({f'{h}_base': float(eb.iloc[0]), f'{h}_instruct': float(ei.iloc[0]),
+                              f'{h}_instruct_minus_base': float(ei.iloc[0] - eb.iloc[0])})
+            gi = lp[lp['model'] == m].sort_values('layer')
+            gb = lp[lp['model'] == b].sort_values('layer')
+            grid = np.linspace(0, 1, self.cfg.CURVE_GRID)
+            ci = np.interp(grid, gi['relative_depth'], gi['auroc'])
+            cb = np.interp(grid, gb['relative_depth'], gb['auroc'])
+            r.update({'peak_auroc_base': float(gb['auroc'].max()), 'peak_auroc_instruct': float(gi['auroc'].max()),
+                      'peak_depth_base': float(gb.loc[gb['auroc'].idxmax(), 'relative_depth']),
+                      'peak_depth_instruct': float(gi.loc[gi['auroc'].idxmax(), 'relative_depth']),
+                      'curve_r_first_differences': float(np.corrcoef(np.diff(ci), np.diff(cb))[0, 1])})
+            rows.append(r)
+        if rows:
+            self.save(pd.DataFrame(rows), 'base_vs_instruct')
 
     # ── RQ5 — alignment of normalised-depth curves ──────────────────────────
     def curve_alignment(self):
@@ -2632,20 +2841,19 @@ class Aggregator:
         fd = self.d['figures']
         pal = dict(zip([m.name for m in self.models],
                        sns.color_palette('husl', max(len(self.models), 1))))
-        lp, rnd = self.table('layers_primary'), self.table('layers_random_init')
+        lp_all, rnd = self.table('layers_primary'), self.table('layers_random_init')
         base = self.table('baselines_no_hidden_state')
-
-        def depth(g):
-            return g['relative_depth']
+        lp = lp_all[lp_all['model'].map(self.variant) == 'base'] if not lp_all.empty else lp_all
+        depth = 'relative_depth'
         if not lp.empty:
             fig, ax = plt.subplots(figsize=(10, 6))
             for m, g in lp.groupby('model'):
                 g = g.sort_values('layer')
-                ax.plot(depth(g), g['auroc'], '-', color=pal[m], lw=2, label=m)
-                ax.fill_between(depth(g), g['auroc_ci95_low'], g['auroc_ci95_high'], color=pal[m], alpha=.15)
+                ax.plot(g[depth], g['auroc'], '-', color=pal[m], lw=2, label=m)
+                ax.fill_between(g[depth], g['auroc_ci95_low'], g['auroc_ci95_high'], color=pal[m], alpha=.15)
                 r = rnd[rnd['model'] == m].sort_values('layer') if not rnd.empty else pd.DataFrame()
                 if not r.empty:
-                    ax.plot(depth(r), r['auroc'], ':', color=pal[m], lw=1.5)
+                    ax.plot(r[depth], r['auroc'], ':', color=pal[m], lw=1.5)
                 b = base[base['model'] == m] if not base.empty else pd.DataFrame()
                 if not b.empty:
                     ax.axhline(b['auroc'].max(), color=pal[m], ls='--', lw=0.8, alpha=.7)
@@ -2660,13 +2868,13 @@ class Aggregator:
             slope = self.table('frequency_continuous_slope')
             for m, g in lp.groupby('model'):
                 g = g.sort_values('layer')
-                a1.plot(depth(g), g['freq_delta_auroc'], color=pal[m], lw=2, label=m)
-                a1.fill_between(depth(g), g['freq_delta_auroc_ci95_low'], g['freq_delta_auroc_ci95_high'],
+                a1.plot(g[depth], g['freq_delta_auroc'], color=pal[m], lw=2, label=m)
+                a1.fill_between(g[depth], g['freq_delta_auroc_ci95_low'], g['freq_delta_auroc_ci95_high'],
                                 color=pal[m], alpha=.15)
                 s = slope[slope['model'] == m].sort_values('layer') if not slope.empty else pd.DataFrame()
                 if not s.empty:
-                    a2.plot(depth(s), s['hal_beta'], color=pal[m], lw=2)
-                    a2.fill_between(depth(s), s['hal_beta'] - 1.96 * s['hal_se_hc3'],
+                    a2.plot(s[depth], s['hal_beta'], color=pal[m], lw=2)
+                    a2.fill_between(s[depth], s['hal_beta'] - 1.96 * s['hal_se_hc3'],
                                     s['hal_beta'] + 1.96 * s['hal_se_hc3'], color=pal[m], alpha=.15)
             for ax in (a1, a2):
                 ax.axhline(0, color='grey', lw=0.8)
@@ -2683,13 +2891,14 @@ class Aggregator:
             for ax, items in zip(axes, ('words', 'nonwords')):
                 for m, g in rt[(rt['items'] == items) & (rt['predictor'] == 'probe_evidence_S')].groupby('model'):
                     g = g.sort_values('layer')
-                    ax.plot(depth(g), g['delta_r2'], color=pal[m], lw=2, label=m)
+                    ax.plot(g[depth], g['delta_r2'], color=pal[m], lw=2, label=m)
                 ax.set(xlabel='relative depth', ylabel='ΔR² of lexical evidence over covariates',
                        title=f'H3: incremental validity for ELP RT ({items})')
             axes[0].legend(fontsize=7, ncol=2)
             fig.tight_layout(); fig.savefig(os.path.join(fd, 'F3_rt_incremental_validity.png'), dpi=250); plt.close(fig)
 
         c = self.table('confirmatory_tests')
+        c = c[c['model'].map(self.variant) == 'base'] if not c.empty else c
         if not c.empty:
             hyps = sorted(c['hypothesis'].unique())
             fig, axes = plt.subplots(1, len(hyps), figsize=(4 * len(hyps), 0.45 * c['model'].nunique() + 2))
@@ -2734,6 +2943,20 @@ class Aggregator:
             ax.legend(fontsize=7, ncol=2)
             fig.tight_layout(); fig.savefig(os.path.join(fd, 'F6_prompt_robustness.png'), dpi=250); plt.close(fig)
 
+        pairs = [(m, s['base_of']) for m, s in self.summaries.items()
+                 if self.variant(m) == 'instruct' and s.get('base_of') in self.summaries]
+        if pairs and not lp_all.empty:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            for m, b in pairs:
+                for name, ls in ((b, '-'), (m, '--')):
+                    g = lp_all[lp_all['model'] == name].sort_values('layer')
+                    ax.plot(g[depth], g['auroc'], ls, color=pal[b], lw=2, label=name)
+            ax.axhline(0.5, color='grey', lw=0.8)
+            ax.set(xlabel='relative depth', ylabel='out-of-fold AUROC',
+                   title='Base (solid) vs instruct counterpart (dashed, chat-template input)')
+            ax.legend(fontsize=7, ncol=2)
+            fig.tight_layout(); fig.savefig(os.path.join(fd, 'F8_base_vs_instruct.png'), dpi=250); plt.close(fig)
+
         p = os.path.join(self.d['aggregate'], 'cka_summary.csv')
         if os.path.exists(p):
             s = pd.read_csv(p)
@@ -2759,25 +2982,39 @@ ANALYSIS_PLAN = {
         'H1c': 'AUROC primary − best no-hidden-state baseline > 0 (paired DeLong; baseline chosen on selection half)',
         'H2': 'AUROC(HF vs NW) − AUROC(LF vs NW) > 0 (DeLong, shared negatives)',
         'H3': 'ΔR² of lexical evidence over the covariate model > 0 (partial F; accuracy-filtered words)',
+        'H4': ('antisymmetric steering along the lexicality direction at the selected layer > random '
+               'directions (direction fitted on the selection half; effect on evaluation-half items)'),
         'layer_selection': 'max balanced accuracy on the SELECTION half (ties → shallowest)',
-        'multiplicity': 'Holm within model across H1a–H3; Holm across models per hypothesis',
+        'multiplicity': ('Holm within model across H1a–H4; Holm across models per hypothesis, separately '
+                         'for base models (headline) and instruct variants (robustness)'),
     },
     'exploratory': ['all layer-wise curves (BH-FDR within model, global BH-FDR across models)',
-                    'continuous frequency slope (effect size), matching, erasure, token strata, decoding',
-                    'nonword RTs, calibration-free native margin, trajectory measures, mixed model',
-                    'MLP and mean-pool controls, label permutation', 'RQ4 interventions', 'RQ5', 'RQ6',
-                    'prompt robustness'],
+                    'continuous frequency slope (effect size), matching, erasure, token strata',
+                    'frequency decoding beyond the LM-internal baseline',
+                    'internal evidence vs output log-probability for RT; nonword RTs; native margin; '
+                    'trajectory measures; mixed model',
+                    'MLP and mean-pool controls, label permutation',
+                    'RQ4 dose-response, subspace / head ablation, attention knockout',
+                    'RQ5 (incl. base vs instruct)', 'RQ6', 'prompt robustness'],
 }
 
-CLAIM_BOUNDARY = {
-    'claimed': 'lexicality is (or is not) linearly decodable from the hidden state at the first-output '
-               'prediction position, with the stated controls',
-    'not_claimed': ['that the LLM predicts WORD/NONWORD at each layer',
-                    'that layer depth is a processing time',
-                    'generality to instruction-tuned models, other languages or other prompts '
-                    'beyond the tested templates'],
-    'confounds_not_controlled': ['morphological family size', 'semantic variables beyond AoA (when supplied)'],
-}
+
+def claim_boundary(info: dict) -> dict:
+    """What can and cannot be claimed, given the lexical norms actually supplied."""
+    used = info.get('word_norms_available', [])
+    standard = {'n_morphemes': 'morpheme count', 'morph_family_size': 'morphological family size',
+                'aoa': 'age of acquisition', 'concreteness': 'concreteness'}
+    return {
+        'claimed': 'lexicality is (or is not) linearly decodable from the hidden state at the first-output '
+                   'prediction position, with the stated controls',
+        'not_claimed': ['that the LLM predicts WORD/NONWORD at each layer outside the H4 intervention',
+                        'that layer depth is a processing time',
+                        'generality to other languages, to prompts beyond the tested templates, or to '
+                        'instruct models beyond the tested base/instruct pairs'],
+        'word_covariates_controlled': ['length', 'Ortho_N', 'sub-word token count',
+                                       'model output log-probability', 'HAL frequency'] + used,
+        'confounds_not_controlled': [v for k, v in standard.items() if k not in used],
+    }
 
 
 def environment_snapshot() -> dict:
@@ -2793,7 +3030,7 @@ def environment_snapshot() -> dict:
 def write_metadata(cfg: Config, data_info: dict):
     meta = {'written': datetime.now().isoformat(), 'seed': SEED, 'config': asdict(cfg),
             'data': data_info, 'prompt_templates': PROMPT_TEMPLATES, 'analysis_plan': ANALYSIS_PLAN,
-            'claim_boundary': CLAIM_BOUNDARY, 'environment': environment_snapshot()}
+            'claim_boundary': claim_boundary(data_info), 'environment': environment_snapshot()}
     with open(os.path.join(cfg.OUTPUT_DIR, 'experiment_metadata.json'), 'w') as f:
         json.dump(meta, f, indent=2, default=str)
 
@@ -2916,6 +3153,55 @@ def run_self_tests(verbose: bool = True) -> bool:
             self.assertEqual(layer_at_depth(36, 0.5), 17)
             self.assertLessEqual(len(select_layers(36, 'representative', 4)), 4)
 
+        def test_decoding_beyond_baseline(self):
+            r = rng0(9)
+            n = 900
+            Z = r.normal(size=(n, 2))
+            X = r.normal(size=(n, 20))
+            folds = np.arange(n) % 5
+            pr = Prober(Config(DEVICE='cpu', PROBE_BACKEND='sklearn'))
+            y_null = Z @ np.array([1.0, -0.5]) + 0.5 * r.normal(size=n)
+            out0 = pr.crossfit_ridge_r2(X, y_null, folds, baseline=Z)
+            self.assertLess(abs(out0['delta_r2_beyond_baseline']), 0.02)
+            y_alt = y_null + X[:, 0]
+            out1 = pr.crossfit_ridge_r2(X, y_alt, folds, baseline=Z)
+            self.assertGreater(out1['delta_r2_beyond_baseline'], 0.2)
+            self.assertLess(out1['p_beyond_baseline'], 1e-6)
+
+        def test_chat_format_shifts_span(self):
+            class Tok:
+                @staticmethod
+                def apply_chat_template(msgs, tokenize, add_generation_prompt):
+                    return f"<s>[USER] {msgs[0]['content']} [/USER][ASSISTANT]"
+            lm = LanguageModel.__new__(LanguageModel)
+            lm.tokenizer, lm.mc = Tok(), ModelConfig('m', 'm', chat=True)
+            txt, sp = build_prompt('house')
+            f, sp2 = lm.format(txt, sp)
+            self.assertEqual(f[sp2[0]:sp2[1]], 'house')
+            lm.mc = ModelConfig('m', 'm')
+            self.assertEqual(lm.format(txt, sp), (txt, sp))
+
+        def test_lexical_norms_merge(self):
+            import tempfile
+            with tempfile.TemporaryDirectory() as d:
+                w = pd.DataFrame({'Word': [f'w{c}{k}' for c in 'abcdefghij' for k in 'abcdefghij'],
+                                  'Length': 3, 'Log_Freq_HAL': np.linspace(1, 12, 100), 'Ortho_N': 2,
+                                  'I_Mean_RT': 600.0, 'I_Mean_Accuracy': 0.9, 'NMorph': 1})
+                w['Word'] = w['Word'].str.replace(r'\d', '', regex=True)
+                nw = pd.DataFrame({'Word': [f'q{c}{k}z' for c in 'abcdefghij' for k in 'abcdefghij'],
+                                   'Length': 4, 'Ortho_N': 1, 'NWI_Mean_RT': 700.0, 'NWI_Mean_Accuracy': 0.9})
+                ext = pd.DataFrame({'Word': w['Word'].str.upper(), 'Conc.M': np.arange(100.0)})
+                for name, df in (('w.csv', w), ('n.csv', nw), ('c.csv', ext)):
+                    df.to_csv(os.path.join(d, name), index=False)
+                cfg = Config(WORDS_PATH=os.path.join(d, 'w.csv'), NONWORDS_PATH=os.path.join(d, 'n.csv'),
+                             LEXICAL_NORMS=[{'path': os.path.join(d, 'c.csv'), 'word_column': 'Word',
+                                             'columns': {'Conc.M': 'concreteness'}}])
+                items, info = load_items(cfg)
+                self.assertEqual(set(info['word_norms_available']), {'n_morphemes', 'concreteness'})
+                self.assertTrue(items.loc[items['is_word'] == 0, 'concreteness'].isna().all())
+                self.assertTrue(items.loc[items['is_word'] == 1, 'concreteness'].notna().all())
+                self.assertIn('concreteness', claim_boundary(info)['word_covariates_controlled'])
+
         def test_prompts(self):
             for name in PROMPT_TEMPLATES:
                 txt, (a, b) = build_prompt('house', name)
@@ -2967,6 +3253,8 @@ def run_experiment(cfg: Config, run_models: list[ModelConfig], aggregate_only=Fa
         raise SystemExit("self-tests failed — refusing to run")
     items, info = load_items(cfg)
     write_metadata(cfg, info)
+    if not cfg.RUN_INSTRUCT_VARIANTS:
+        run_models = [m for m in run_models if m.variant == 'base']
     if not aggregate_only:
         for mc in run_models:
             done = os.path.join(cfg.model_dir(mc.name), 'DONE')
@@ -2976,7 +3264,7 @@ def run_experiment(cfg: Config, run_models: list[ModelConfig], aggregate_only=Fa
             if os.path.exists(done):
                 os.remove(done)
             try:
-                ModelStudy(mc, cfg, items).run()
+                ModelStudy(mc, cfg, items, info['word_norms_available']).run()
             except Exception as e:                                       # noqa: BLE001
                 logger.error(f"[{mc.name}] failed: {e}", exc_info=True)
             gc.collect()
